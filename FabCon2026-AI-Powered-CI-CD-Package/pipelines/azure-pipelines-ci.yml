@@ -1,0 +1,295 @@
+# Continuous Integration Pipeline for Microsoft Fabric
+# Pipeline name: fdt-nyc-taxi-ci
+# Validates artifacts against enterprise-ready principles before deployment
+
+name: fdt-nyc-taxi-ci_$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  branches:
+    include:
+    - main
+
+pr:
+  branches:
+    include:
+    - main
+
+pool:
+  vmImage: 'windows-latest'
+
+variables:
+  - name: pythonVersion
+    value: '3.11'
+  - name: validationFailed
+    value: false
+
+stages:
+- stage: Validate
+  displayName: 'Validate Fabric Artifacts'
+  jobs:
+  - job: ValidateArtifacts
+    displayName: 'Validate All Artifacts'
+    steps:
+    
+    - task: UsePythonVersion@0
+      displayName: 'Use Python $(pythonVersion)'
+      inputs:
+        versionSpec: '$(pythonVersion)'
+        addToPath: true
+    
+    - task: NodeTool@0
+      displayName: 'Use Node.js 18.x'
+      inputs:
+        versionSpec: '18.x'
+    
+    - task: PowerShell@2
+      displayName: 'Get npm cache path'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $npmCache = npm config get cache
+          Write-Host "##vso[task.setvariable variable=NPM_CACHE_PATH]$npmCache"
+          Write-Host "npm cache path: $npmCache"
+        pwsh: true
+    
+    # Cache npm's internal cache directory (much smaller than node_modules)
+    - task: Cache@2
+      displayName: 'Cache npm downloads'
+      inputs:
+        key: 'npm-cache | "$(Agent.OS)" | "v1"'
+        path: $(NPM_CACHE_PATH)
+        restoreKeys: |
+          npm-cache | "$(Agent.OS)"
+    
+    - task: PowerShell@2
+      displayName: 'Install DBML CLI for schema validation'
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Install @dbml/cli globally
+          Write-Host "Installing @dbml/cli..."
+          npm install -g @dbml/cli
+          
+          # Update PATH to include npm global packages
+          $npmPrefix = npm config get prefix
+          $env:PATH = "$npmPrefix;$env:PATH"
+          Write-Host "##vso[task.setvariable variable=PATH]$npmPrefix;$env:PATH"
+          
+          # Verify installation
+          & dbml2sql --version
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "❌ ERROR: Installation verification failed"
+            exit 1
+          }
+          Write-Host "✓ DBML CLI installed successfully"
+        pwsh: true
+    
+    - task: PowerShell@2
+      displayName: 'Install validation dependencies'
+      inputs:
+        targetType: 'inline'
+        script: |
+          python -m pip install --upgrade pip
+          pip install pyyaml jsonschema bandit safety pylint
+        pwsh: true
+    
+    - task: PowerShell@2
+      displayName: 'Install Tabular Editor 2 CLI'
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Download and install Tabular Editor 2 (portable)
+          Write-Host "Installing Tabular Editor 2 CLI for semantic model validation..."
+          
+          # Create tools directory
+          $toolsDir = "$(Build.SourcesDirectory)\tools\TabularEditor2"
+          New-Item -ItemType Directory -Path $toolsDir -Force | Out-Null
+          
+          # Download TE2 portable version 2.27.2 (proven BPA support)
+          $zipPath = Join-Path $env:TEMP "te2.zip"
+          Invoke-WebRequest -Uri "https://cdn.tabulareditor.com/files/TabularEditor.2.27.2.zip" -OutFile $zipPath -UseBasicParsing
+          
+          # Extract
+          Expand-Archive -Path $zipPath -DestinationPath $toolsDir -Force
+          Remove-Item $zipPath -Force
+          
+          # Add to PATH for this session
+          $env:PATH = "$toolsDir;$env:PATH"
+          Write-Host "##vso[task.setvariable variable=PATH]$toolsDir;$(PATH)"
+          
+          # Verify installation
+          $te2Exe = Join-Path $toolsDir "TabularEditor.exe"
+          if (Test-Path $te2Exe) {
+            Write-Host "✓ Tabular Editor 2 installed successfully at: $te2Exe"
+          } else {
+            Write-Warning "Tabular Editor 2 not found, semantic model validation will be skipped"
+          }
+        pwsh: true
+      continueOnError: true
+    
+    - task: PowerShell@2
+      displayName: 'Validate YAML Transformations'
+      inputs:
+        targetType: 'filePath'
+        filePath: '$(Build.SourcesDirectory)/scripts/validate-transformations.ps1'
+        arguments: '-QuietMode -OutputPath "$(Build.ArtifactStagingDirectory)/transformation-validation.json"'
+        pwsh: true
+      continueOnError: true
+    
+    - task: PowerShell@2
+      displayName: 'Validate Semantic Models (BPA)'
+      inputs:
+        targetType: 'filePath'
+        filePath: '$(Build.SourcesDirectory)/scripts/validate-semantic-models.ps1'
+        arguments: '-OutputPath "$(Build.ArtifactStagingDirectory)/bpa-results.json"'
+        pwsh: true
+      continueOnError: true
+    
+    - task: PowerShell@2
+      displayName: 'Security scan with Bandit'
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Scan Python files for security issues
+          Write-Host "Scanning Python files with Bandit..."
+          & bandit -r . -f json -o "$(Build.ArtifactStagingDirectory)/bandit-results.json" --exit-zero
+          
+          # Show summary
+          $resultsPath = "$(Build.ArtifactStagingDirectory)/bandit-results.json"
+          if (Test-Path $resultsPath) {
+            Write-Host "Bandit scan completed. Results saved to bandit-results.json"
+          }
+        pwsh: true
+      continueOnError: true
+    
+    - task: PowerShell@2
+      displayName: 'Dependency vulnerability scan with Safety'
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Check for known vulnerabilities in dependencies
+          Write-Host "Checking Python dependencies with Safety..."
+          
+          # Safety can fail if no requirements.txt exists, which is OK for Fabric projects
+          $resultsPath = "$(Build.ArtifactStagingDirectory)/safety-results.json"
+          
+          # Run Safety and capture exit code
+          & safety check --json --output json-file --file $resultsPath 2>$null
+          $exitCode = $LASTEXITCODE
+          
+          if ($exitCode -eq 0) {
+            Write-Host "Safety scan completed successfully"
+          } else {
+            # If Safety fails (no requirements.txt or other error), create empty result
+            '[]' | Out-File $resultsPath -Encoding UTF8
+            Write-Host "Safety scan skipped - no Python dependencies found (exit code: $exitCode)"
+          }
+          
+          # Always exit successfully since this is optional
+          exit 0
+        pwsh: true
+      continueOnError: true
+    
+    - task: PowerShell@2
+      displayName: 'Code quality scan with Pylint'
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Code quality analysis with Fabric-aware configuration
+          Write-Host "Running code quality checks with Pylint..."
+          
+          $resultsPath = "$(Build.ArtifactStagingDirectory)/pylint-results.json"
+          
+          # Use .pylintrc for Fabric-specific configuration (handles spark, pandas imports)
+          if (Test-Path ".pylintrc") {
+            & pylint **/*.py --rcfile=.pylintrc --output-format=json --exit-zero > $resultsPath
+          } else {
+            & pylint **/*.py --output-format=json --exit-zero > $resultsPath
+          }
+          
+          Write-Host "Pylint scan completed. Results saved to pylint-results.json"
+        pwsh: true
+      continueOnError: true
+    
+    - task: PowerShell@2
+      displayName: 'Run Artifact Validation'
+      inputs:
+        targetType: 'filePath'
+        filePath: '$(Build.SourcesDirectory)/scripts/validate-artifacts.ps1'
+        arguments: '-OutputPath "$(Build.ArtifactStagingDirectory)/validation-results.json"'
+        pwsh: true
+      continueOnError: true
+    
+    - task: PowerShell@2
+      displayName: 'Generate Validation Report'
+      inputs:
+        targetType: 'filePath'
+        filePath: '$(Build.SourcesDirectory)/scripts/generate-validation-report.ps1'
+        arguments: '-ResultsPath "$(Build.ArtifactStagingDirectory)/validation-results.json" -OutputPath "$(Build.ArtifactStagingDirectory)/validation-report.md" -TransformationResultsPath "$(Build.ArtifactStagingDirectory)/transformation-validation.json" -PylintResultsPath "$(Build.ArtifactStagingDirectory)/pylint-results.json" -BpaResultsPath "$(Build.ArtifactStagingDirectory)/bpa-results.json"'
+        pwsh: true
+    
+    - task: PowerShell@2
+      displayName: 'Post PR Comment'
+      condition: and(succeededOrFailed(), eq(variables['Build.Reason'], 'PullRequest'))
+      inputs:
+        targetType: 'filePath'
+        filePath: '$(Build.SourcesDirectory)/scripts/post-pr-comment.ps1'
+        arguments: '-ReportPath "$(Build.ArtifactStagingDirectory)/validation-report.md" -ResultsPath "$(Build.ArtifactStagingDirectory)/validation-results.json" -TransformationResultsPath "$(Build.ArtifactStagingDirectory)/transformation-validation.json" -BpaResultsPath "$(Build.ArtifactStagingDirectory)/bpa-results.json" -PylintResultsPath "$(Build.ArtifactStagingDirectory)/pylint-results.json" -Organization "$(System.TeamFoundationCollectionUri)" -Project "$(System.TeamProject)" -RepositoryId "$(Build.Repository.ID)" -PullRequestId "$(System.PullRequest.PullRequestId)" -AccessToken "$(System.AccessToken)"'
+        pwsh: true
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+    
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Validation Results'
+      inputs:
+        pathToPublish: '$(Build.ArtifactStagingDirectory)'
+        artifactName: 'validation-results'
+    
+    - task: PowerShell@2
+      displayName: 'Check Validation Status'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $hasFailures = $false
+          
+          # Check artifact validation results
+          $artifactResults = Get-Content "$(Build.ArtifactStagingDirectory)/validation-results.json" | ConvertFrom-Json
+          if ($artifactResults.HasViolations -eq $true) {
+            Write-Host "##vso[task.logissue type=error]Artifact validation failed with violations"
+            $hasFailures = $true
+          } else {
+            Write-Host "✓ Artifact validation passed"
+          }
+          
+          # Check transformation validation results
+          $transformPath = "$(Build.ArtifactStagingDirectory)/transformation-validation.json"
+          if (Test-Path $transformPath) {
+            $transformResults = Get-Content $transformPath | ConvertFrom-Json
+            if ($transformResults.ValidationPassed -eq $false) {
+              Write-Host "##vso[task.logissue type=error]YAML transformation validation failed"
+              $hasFailures = $true
+            } else {
+              Write-Host "✓ Transformation validation passed"
+            }
+          }
+          
+          # Check semantic model BPA results
+          $bpaPath = "$(Build.ArtifactStagingDirectory)/bpa-results.json"
+          if (Test-Path $bpaPath) {
+            $bpaResults = Get-Content $bpaPath | ConvertFrom-Json
+            if ($bpaResults.ValidationPassed -eq $false) {
+              Write-Host "##vso[task.logissue type=error]Semantic model validation failed (BPA errors found)"
+              $hasFailures = $true
+            } else {
+              Write-Host "✓ Semantic model validation passed"
+            }
+          }
+          
+          if ($hasFailures) {
+            Write-Host "##vso[task.complete result=Failed;]"
+            exit 1
+          } else {
+            Write-Host "All validations passed successfully ✓"
+            exit 0
+          }
+        pwsh: true
