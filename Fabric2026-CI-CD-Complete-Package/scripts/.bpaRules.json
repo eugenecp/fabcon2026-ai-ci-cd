@@ -1,0 +1,231 @@
+[
+  {
+    "ID": "BPA_INFO",
+    "Name": "README: Fabric Semantic Model BPA Scope and Limitations",
+    "Category": "Documentation",
+    "Description": "Fabric Semantic Model BPA rules: documentation, naming, UX hygiene, relationships, and measure conventions. NOTE: Direct Lake properties (EntityName, SchemaName, ExpressionSource) are not accessible via Tabular Editor BPA. Use structural validation (e.g., validate-semantic-models.ps1) to detect hardcoded OneLake GUIDs, lakehouse/workspace names, schema names, and other TMDL-level anti-patterns.",
+    "Severity": 1,
+    "Scope": "Model",
+    "Expression": "false",
+    "CompatibilityLevel": 1500
+  },
+  // ---------------------------------------------------------------------------
+  // Documentation
+  // ---------------------------------------------------------------------------
+  {
+    "ID": "DOC_TABLE_DESCRIPTION",
+    "Name": "[Documentation] Tables should have descriptions",
+    "Category": "Documentation",
+    "Description": "All tables should have a description to improve discoverability and self-service understanding.",
+    "Severity": 1,
+    "Scope": "Table",
+    "Expression": "string.IsNullOrWhiteSpace(Description)",
+    "CompatibilityLevel": 1500
+  },
+  {
+    "ID": "DOC_MEASURE_DESCRIPTION",
+    "Name": "[Documentation] Measures should have descriptions",
+    "Category": "Documentation",
+    "Description": "Measures should have descriptions documenting business meaning, filters, and assumptions.",
+    "Severity": 1,
+    "Scope": "Measure",
+    "Expression": "string.IsNullOrWhiteSpace(Description) and not Table.Name.EndsWith(\"_measures\")",
+    "CompatibilityLevel": 1500
+  },
+  {
+    "ID": "DOC_KEY_COLUMN_DESCRIPTION",
+    "Name": "[Documentation] Key columns should have descriptions",
+    "Category": "Documentation",
+    "Description": "Primary/foreign keys should have descriptions (relationships, grain, uniqueness expectations).",
+    "Severity": 1,
+    "Scope": "Column",
+    "Expression": "(Name.EndsWith(\"_key\") or Name.EndsWith(\"_id\") or Name.EndsWith(\"_ref_id\")) and string.IsNullOrWhiteSpace(Description)",
+    "CompatibilityLevel": 1500
+  },
+  // ---------------------------------------------------------------------------
+  // Naming conventions (Gold semantic layer)
+  // ---------------------------------------------------------------------------
+  {
+    "ID": "NAME_TABLE_PREFIXES",
+    "Name": "[Naming] Enforce semantic layer table prefixes",
+    "Category": "Naming Conventions",
+    "Description": "Semantic layer tables should follow naming conventions: dimensions start with 'dim_', facts start with 'fact_'. Allow common exceptions: bridge_, calc_, measures/_measures, and technical tables starting with '_'.",
+    "Severity": 2,
+    "Scope": "Table",
+    "Expression": "not (Name.StartsWith(\"dim_\") or Name.StartsWith(\"fact_\") or Name.StartsWith(\"bridge_\") or Name.StartsWith(\"calc_\") or Name.Equals(\"measures\") or Name.Equals(\"_measures\") or Name.EndsWith(\"_measures\") or Name.StartsWith(\"_\"))",
+    "CompatibilityLevel": 1500
+  },
+  {
+    "ID": "NAME_NO_SPACES_TABLE",
+    "Name": "[Naming] Avoid spaces in table names",
+    "Category": "Naming Conventions",
+    "Description": "Avoid spaces in table names to simplify DAX, scripting, and governance.",
+    "Severity": 1,
+    "Scope": "Table",
+    "Expression": "Name.Contains(\" \")",
+    "CompatibilityLevel": 1500
+  },
+  {
+    "ID": "NAME_NO_SPACES_COLUMN",
+    "Name": "[Naming] Avoid spaces in column names",
+    "Category": "Naming Conventions",
+    "Description": "Avoid spaces in column names to simplify DAX and reduce quoting.",
+    "Severity": 1,
+    "Scope": "Column",
+    "Expression": "Name.Contains(\" \")",
+    "CompatibilityLevel": 1500
+  },
+  {
+    "ID": "NAME_NO_SPACES_MEASURE",
+    "Name": "[Naming] Avoid spaces in measure names",
+    "Category": "Naming Conventions",
+    "Description": "Avoid spaces in measure names to simplify authoring and reuse in DAX.",
+    "Severity": 1,
+    "Scope": "Measure",
+    "Expression": "Name.Contains(\" \")",
+    "CompatibilityLevel": 1500
+  },
+  // ---------------------------------------------------------------------------
+  // User Experience / Hygiene
+  // ---------------------------------------------------------------------------
+  {
+    "ID": "UX_HIDE_TECHNICAL_COLUMNS",
+    "Name": "[User Experience] Hide technical/audit columns",
+    "Category": "User Experience",
+    "Description": "Hide common technical columns not intended for report authoring (hash/etag/rowversion/audit/ingestion/CDC metadata).",
+    "Severity": 1,
+    "Scope": "Column",
+    "Expression": "IsHidden == false and (Name.StartsWith(\"_\") or Name.EndsWith(\"_hash\") or Name.EndsWith(\"_rowhash\") or Name.EndsWith(\"_etag\") or Name.EndsWith(\"_rowversion\") or Name.Contains(\"ingest\") or Name.Contains(\"ingestion\") or Name.Contains(\"cdc\") or Name.Contains(\"created\") or Name.Contains(\"updated\") or Name.Contains(\"modified\") or Name.Contains(\"inserted\") or Name.Contains(\"timestamp\") or Name.StartsWith(\"load_\"))",
+    "FixExpression": "IsHidden = true",
+    "CompatibilityLevel": 1500
+  },
+  {
+    "ID": "UX_HIDE_FOREIGN_KEYS",
+    "Name": "[User Experience] Foreign key columns should be hidden",
+    "Category": "User Experience",
+    "Description": "Hide relationship keys from the field list (except the primary key in dimension tables).",
+    "Severity": 1,
+    "Scope": "Column",
+    "Expression": "(Name.EndsWith(\"_key\") or Name.EndsWith(\"_id\") or Name.EndsWith(\"_ref_id\")) and not (Table.Name.StartsWith(\"dim_\") and Name == Table.Name.Substring(4) + \"_key\") and IsHidden == false",
+    "FixExpression": "IsHidden = true",
+    "CompatibilityLevel": 1500
+  },
+  {
+    "ID": "UX_DIMENSION_PK_VISIBLE",
+    "Name": "[User Experience] Dimension primary keys should be visible",
+    "Category": "User Experience",
+    "Description": "Dimension primary key columns (dim_*.<dim>_key) should remain visible to support filtering/navigation when appropriate.",
+    "Severity": 1,
+    "Scope": "Column",
+    "Expression": "Table.Name.StartsWith(\"dim_\") and Name.EndsWith(\"_key\") and Name == Table.Name.Substring(4) + \"_key\" and IsHidden == true",
+    "FixExpression": "IsHidden = false",
+    "CompatibilityLevel": 1500
+  },
+  {
+    "ID": "UX_MEASURES_TABLE_HIDDEN",
+    "Name": "[User Experience] Measures table should be hidden",
+    "Category": "User Experience",
+    "Description": "A dedicated measures table (measures/_measures) should be hidden to keep the field list clean. Measures remain visible even if the table is hidden.",
+    "Severity": 1,
+    "Scope": "Table",
+    "Expression": "(Name.Equals(\"measures\") or Name.Equals(\"_measures\")) and IsHidden == false",
+    "FixExpression": "IsHidden = true",
+    "CompatibilityLevel": 1500
+  },
+  // ---------------------------------------------------------------------------
+  // Date usability (reduced false positives)
+  // ---------------------------------------------------------------------------
+  {
+    "ID": "UX_DATE_DIMENSION_HIERARCHY",
+    "Name": "[User Experience] Date dimensions should have hierarchies",
+    "Category": "User Experience",
+    "Description": "Date dimensions (dim_date*) should define useful hierarchies (Year > Quarter > Month > Day).",
+    "Severity": 1,
+    "Scope": "Table",
+    "Expression": "(Name.Equals(\"dim_date\") or Name.StartsWith(\"dim_date_\")) and Hierarchies.Count == 0",
+    "CompatibilityLevel": 1500
+  },
+  // ---------------------------------------------------------------------------
+  // Relationships (Fabric/Direct Lake: keep conservative)
+  // ---------------------------------------------------------------------------
+  {
+    "ID": "REL_AVOID_BIDIRECTIONAL",
+    "Name": "[Performance] Avoid bidirectional relationships",
+    "Category": "Performance",
+    "Description": "Bidirectional relationships can introduce ambiguity and can negatively affect performance. Prefer single-direction relationships. Review exceptions carefully (bridge/M2M/RLS patterns).",
+    "Severity": 2,
+    "Scope": "Relationship",
+    "Expression": "CrossFilteringBehavior == CrossFilteringBehavior.BothDirections",
+    "CompatibilityLevel": 1500
+  },
+  {
+    "ID": "REL_AVOID_M2M",
+    "Name": "[Performance] Avoid many-to-many relationships",
+    "Category": "Performance",
+    "Description": "Many-to-many relationships often cause ambiguous results and can be slow. Prefer bridge tables with one-to-many relationships and explicit DAX patterns.",
+    "Severity": 2,
+    "Scope": "Relationship",
+    "Expression": "FromCardinality.ToString() == \"Many\" and ToCardinality.ToString() == \"Many\"",
+    "CompatibilityLevel": 1500
+  },
+  // ---------------------------------------------------------------------------
+  // Measures (Fabric-friendly, high ROI)
+  // ---------------------------------------------------------------------------
+  {
+    "ID": "MEASURE_FORMAT_REQUIRED",
+    "Name": "[User Experience] Measures should have format strings",
+    "Category": "User Experience",
+    "Description": "Measures should define a format string (currency, percent, decimals, whole number) for consistent visuals and interpretation.",
+    "Severity": 1,
+    "Scope": "Measure",
+    "Expression": "string.IsNullOrWhiteSpace(FormatString)",
+    "CompatibilityLevel": 1500
+  },
+  {
+    "ID": "MEASURE_FOLDER_RECOMMENDED",
+    "Name": "[User Experience] Measures should be organized in display folders",
+    "Category": "User Experience",
+    "Description": "Use display folders to organize measures for report authors (recommended for medium/large models).",
+    "Severity": 1,
+    "Scope": "Measure",
+    "Expression": "string.IsNullOrWhiteSpace(DisplayFolder)",
+    "CompatibilityLevel": 1500
+  },
+  {
+    "ID": "MEASURE_ONLY_IN_FACT_TABLES",
+    "Name": "[Best Practice] Measures should only be defined in fact tables",
+    "Category": "Best Practice",
+    "Description": "Measures represent aggregations of quantitative data and should only be defined in fact tables (fact_*) or dedicated measures tables (measures/_measures). Dimension tables provide context/attributes for filtering, not calculations.",
+    "Severity": 2,
+    "Scope": "Measure",
+    "Expression": "not (Table.Name.StartsWith(\"fact_\") or Table.Name.Equals(\"measures\") or Table.Name.Equals(\"_measures\") or Table.Name.EndsWith(\"_measures\"))",
+    "CompatibilityLevel": 1500
+  },
+  // ---------------------------------------------------------------------------
+  // Columns: hygiene (safe in Fabric + good for UX)
+  // ---------------------------------------------------------------------------
+  {
+    "ID": "COL_HIDE_UNUSED",
+    "Name": "[Hygiene] Hide unused columns",
+    "Category": "Hygiene",
+    "Description": "Hide columns that are not used in relationships and are not referenced by other model objects. Excludes descriptive columns (*_name, *_code, *_desc, *_type, *_number), boolean columns (useful for filtering), and Data Agent metric columns (*_step, *_group, *_minutes, *_count) that may be needed for natural language queries and analysis.",
+    "Severity": 1,
+    "Scope": "Column",
+    "Expression": "IsHidden == false and !IsKey and !UsedInRelationships.Any() and !ReferencedBy.Any() and !(DataType == DataType.Boolean or Name.EndsWith(\"_name\") or Name.EndsWith(\"_code\") or Name.EndsWith(\"_desc\") or Name.EndsWith(\"_type\") or Name.EndsWith(\"_number\") or Name.EndsWith(\"_step\") or Name.EndsWith(\"_group\") or Name.EndsWith(\"_minutes\") or Name.EndsWith(\"_count\"))",
+    "FixExpression": "IsHidden = true",
+    "CompatibilityLevel": 1500
+  },
+  // ---------------------------------------------------------------------------
+  // Calculated columns (still relevant: affects DAX complexity; also can affect refresh)
+  // ---------------------------------------------------------------------------
+  {
+    "ID": "PERF_AVOID_FACT_CALC_COLUMNS",
+    "Name": "[Performance] Avoid calculated columns in fact tables",
+    "Category": "Performance",
+    "Description": "Calculated columns in large fact tables increase processing overhead and can complicate maintenance. Prefer measures or upstream transformations when possible.",
+    "Severity": 1,
+    "Scope": "Column",
+    "Expression": "Table.Name.StartsWith(\"fact_\") and Type.ToString() == \"Calculated\"",
+    "CompatibilityLevel": 1500
+  }
+]

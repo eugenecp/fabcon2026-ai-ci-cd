@@ -1,0 +1,147 @@
+# CI Pipeline - Complete Example
+# Validates Microsoft Fabric artifacts against enterprise-ready principles
+
+name: your-project-ci_$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  branches:
+    include:
+    - main
+
+pr:
+  branches:
+    include:
+    - main
+
+pool:
+  vmImage: 'windows-latest'
+
+variables:
+  - name: pythonVersion
+    value: '3.11'
+  - name: nodeVersion
+    value: '18.x'
+
+stages:
+- stage: Validate
+  displayName: 'Validate Fabric Artifacts'
+  jobs:
+  - job: ValidateArtifacts
+    displayName: 'Validate All Artifacts'
+    steps:
+    
+    # Setup Python environment
+    - task: UsePythonVersion@0
+      displayName: 'Use Python $(pythonVersion)'
+      inputs:
+        versionSpec: '$(pythonVersion)'
+        addToPath: true
+    
+    # Setup Node.js for semantic model validation
+    - task: NodeTool@0
+      displayName: 'Use Node.js $(nodeVersion)'
+      inputs:
+        versionSpec: '$(nodeVersion)'
+    
+    # Install Python dependencies
+    - task: PowerShell@2
+      displayName: 'Install Python Dependencies'
+      inputs:
+        targetType: 'inline'
+        script: |
+          Write-Host "Installing Python packages..."
+          pip install --upgrade pip
+          pip install ast-grep bandit pylint
+          Write-Host "Python packages installed successfully"
+    
+    # Install Node.js dependencies for BPA
+    - task: PowerShell@2
+      displayName: 'Install Node.js Dependencies'
+      inputs:
+        targetType: 'inline'
+        script: |
+          Write-Host "Installing BPA rules package..."
+          npm install -g @microsoft/powerbi-modeling-best-practices-rules
+          Write-Host "BPA package installed successfully"
+    
+    # Validate all Fabric artifacts
+    - task: PowerShell@2
+      displayName: 'Validate All Artifacts'
+      inputs:
+        filePath: '$(Build.SourcesDirectory)/scripts/validate-artifacts.ps1'
+        arguments: '-OutputPath "$(Build.ArtifactStagingDirectory)/validation-results.json"'
+      continueOnError: true
+      env:
+        BUILD_REASON: $(Build.Reason)
+    
+    # Generate human-readable validation report
+    - task: PowerShell@2
+      displayName: 'Generate Validation Report'
+      inputs:
+        filePath: '$(Build.SourcesDirectory)/scripts/generate-validation-report.ps1'
+        arguments: >
+          -ResultsPath "$(Build.ArtifactStagingDirectory)/validation-results.json"
+          -OutputPath "$(Build.ArtifactStagingDirectory)/validation-report.md"
+      condition: always()
+    
+    # Display validation report in build log
+    - task: PowerShell@2
+      displayName: 'Display Validation Report'
+      inputs:
+        targetType: 'inline'
+        script: |
+          if (Test-Path "$(Build.ArtifactStagingDirectory)/validation-report.md") {
+            Write-Host "=== Validation Report ==="
+            Get-Content "$(Build.ArtifactStagingDirectory)/validation-report.md"
+          } else {
+            Write-Host "No validation report found"
+          }
+      condition: always()
+    
+    # Post PR comment with validation results
+    - task: PowerShell@2
+      displayName: 'Post PR Comment'
+      condition: eq(variables['Build.Reason'], 'PullRequest')
+      inputs:
+        filePath: '$(Build.SourcesDirectory)/scripts/post-pr-comment.ps1'
+        arguments: >
+          -ResultsPath "$(Build.ArtifactStagingDirectory)/validation-results.json"
+          -PullRequestId $(System.PullRequest.PullRequestId)
+          -RepositoryId $(Build.Repository.ID)
+          -ProjectId $(System.TeamProjectId)
+          -OrganizationUri $(System.CollectionUri)
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+    
+    # Publish validation artifacts for review
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Validation Results'
+      condition: always()
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'validation-results'
+        publishLocation: 'Container'
+    
+    # Fail build if validation found errors
+    - task: PowerShell@2
+      displayName: 'Check Validation Status'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $resultsPath = "$(Build.ArtifactStagingDirectory)/validation-results.json"
+          
+          if (Test-Path $resultsPath) {
+            $results = Get-Content $resultsPath | ConvertFrom-Json
+            $errorCount = ($results.results | Where-Object { $_.severity -eq 'Error' }).Count
+            
+            if ($errorCount -gt 0) {
+              Write-Host "##vso[task.logissue type=error]Validation failed with $errorCount error(s)"
+              Write-Host "##vso[task.complete result=Failed;]"
+              exit 1
+            } else {
+              Write-Host "✅ All validations passed successfully"
+            }
+          } else {
+            Write-Host "##vso[task.logissue type=warning]No validation results found"
+          }
+      condition: always()

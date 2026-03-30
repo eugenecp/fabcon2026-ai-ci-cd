@@ -1,0 +1,192 @@
+# Deployment Stage Template for Microsoft Fabric Workspaces
+# This template handles deployment to a single environment (CI, DEV, QA, or PROD)
+
+parameters:
+  - name: environmentName
+    type: string
+  - name: environmentDisplayName
+    type: string
+  - name: azureDevOpsEnvironment
+    type: string
+  - name: variableGroup
+    type: string
+  - name: deployBranchPrefix
+    type: string
+  - name: azureSubscription
+    type: string
+    default: ''
+  - name: dependsOn
+    type: object
+    default: ['Build']
+  - name: cleanValueSets
+    type: boolean
+    default: true
+
+stages:
+- stage: Deploy${{ parameters.environmentName }}
+  displayName: 'Deploy to ${{ parameters.environmentDisplayName }}'
+  dependsOn: ${{ parameters.dependsOn }}
+  condition: succeeded()
+  variables:
+    - group: ${{ parameters.variableGroup }}
+    - name: buildVersion
+      value: $[ stageDependencies.Build.CreateBuildVersion.outputs['VersionInfo.buildVersion'] ]
+    - name: environmentName
+      value: '${{ parameters.environmentName }}'
+    - name: deployBranchPrefix
+      value: '${{ parameters.deployBranchPrefix }}'
+  jobs:
+  - deployment: DeployTo${{ parameters.environmentName }}
+    displayName: 'Deploy to ${{ parameters.environmentDisplayName }} Environment'
+    environment: '${{ parameters.azureDevOpsEnvironment }}'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          
+          - checkout: self
+            persistCredentials: true
+            clean: true
+          
+          - task: PowerShell@2
+            displayName: 'Create Release Branch'
+            inputs:
+              targetType: 'inline'
+              script: |
+                $branchPrefix = "$(deployBranchPrefix)"
+                $version = "$(buildVersion)"
+                $branch = "$branchPrefix/$version"
+                $sourceCommit = "$(Build.SourceVersion)"
+                
+                Write-Host "##[section]Creating release branch: $branch"
+                Write-Host "  Source commit: $sourceCommit"
+                
+                git config user.email "azuredevops@fabric.deployment"
+                git config user.name "Azure DevOps Deployment"
+                
+                # Create new branch from current HEAD (already checked out by pipeline)
+                Write-Host "Creating new release branch $branch from current checkout..."
+                git checkout -b $branch
+                
+                # Push the new release branch
+                git push origin $branch
+                
+                Write-Host "✓ Release branch $branch created successfully"
+              pwsh: true
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+          
+          - ${{ if eq(parameters.cleanValueSets, true) }}:
+            - task: PowerShell@2
+              displayName: 'Clean Value Sets Before Deployment'
+              inputs:
+                targetType: 'inline'
+                script: |
+                  Write-Host "##[section]Cleaning existing value sets from Variable Libraries"
+                  $varLibs = Get-ChildItem -Path "$(Build.SourcesDirectory)" -Filter "*.VariableLibrary" -Directory -Recurse
+                  foreach ($varLib in $varLibs) {
+                    $valueSetsPath = Join-Path $varLib.FullName "valueSets"
+                    if (Test-Path $valueSetsPath) {
+                      Write-Host "Removing value sets from: $($varLib.Name)"
+                      Remove-Item -Path $valueSetsPath -Recurse -Force
+                    }
+                  }
+                  Write-Host "✓ Value sets cleanup completed"
+                pwsh: true
+          
+          - ${{ if ne(parameters.azureSubscription, '') }}:
+            - task: AzureCLI@2
+              displayName: 'Authenticate with Azure CLI'
+              inputs:
+                azureSubscription: '${{ parameters.azureSubscription }}'
+                scriptType: 'pscore'
+                scriptLocation: 'inlineScript'
+                inlineScript: |
+                  Write-Host "##[section]Azure CLI authenticated successfully"
+                  Write-Host "Subscription: $(az account show --query name -o tsv)"
+                  Write-Host "Tenant: $(az account show --query tenantId -o tsv)"
+          
+          - task: PowerShell@2
+            displayName: 'Deploy to Fabric Workspace (${{ parameters.environmentDisplayName }})'
+            inputs:
+              targetType: 'filePath'
+              filePath: '$(Build.SourcesDirectory)/scripts/deploy-to-fabric.ps1'
+              arguments: >
+                -WorkspaceName "$(WorkspaceName)"
+                -BranchName "$(deployBranchPrefix)/$(buildVersion)"
+                -EnvironmentDisplayName "${{ parameters.environmentDisplayName }}"
+                -LakehouseName "$(LakehouseName)"
+                -BuildVersion "$(buildVersion)"
+              pwsh: true
+            env:
+              AZURE_TENANT_ID: $(AZURE_TENANT_ID)
+              AZURE_CLIENT_ID: $(AZURE_CLIENT_ID)
+              AZURE_CLIENT_SECRET: $(AZURE_CLIENT_SECRET)
+              SYSTEM_COLLECTIONURI: $(System.CollectionUri)
+              SYSTEM_TEAMPROJECT: $(System.TeamProject)
+              BUILD_REPOSITORY_NAME: $(Build.Repository.Name)
+          
+          - task: PowerShell@2
+            displayName: 'Update Variable Library with Workspace Artifact IDs'
+            inputs:
+              targetType: 'filePath'
+              filePath: '$(Build.SourcesDirectory)/scripts/substitute-variable-libraries.ps1'
+              arguments: '-WorkspaceName "$(WorkspaceName)" -Environment "$(environmentName)" -SourcePath "$(Build.SourcesDirectory)" -BranchName "$(deployBranchPrefix)/$(buildVersion)" -BuildVersion "$(buildVersion)"'
+              pwsh: true
+            env:
+              AZURE_TENANT_ID: $(AZURE_TENANT_ID)
+              AZURE_CLIENT_ID: $(AZURE_CLIENT_ID)
+              AZURE_CLIENT_SECRET: $(AZURE_CLIENT_SECRET)
+          
+          - task: PowerShell@2
+            displayName: 'Upload Transformation Files to Lakehouse'
+            inputs:
+              targetType: 'filePath'
+              filePath: '$(Build.SourcesDirectory)/scripts/upload-transformation-files.ps1'
+              arguments: '-WorkspaceName "$(WorkspaceName)" -LakehouseName "$(LakehouseName)" -Version "$(buildVersion)" -SourcePath "$(Build.SourcesDirectory)"'
+              pwsh: true
+            env:
+              AZURE_TENANT_ID: $(AZURE_TENANT_ID)
+              AZURE_CLIENT_ID: $(AZURE_CLIENT_ID)
+              AZURE_CLIENT_SECRET: $(AZURE_CLIENT_SECRET)
+          
+          - ${{ if eq(parameters.environmentName, 'PROD') }}:
+            - task: PowerShell@2
+              displayName: 'Create Release Notes'
+              inputs:
+                targetType: 'inline'
+                script: |
+                  $version = "$(buildVersion)"
+                  
+                  Write-Host "##[section]Creating Release Notes for Version $version"
+                  
+                  # Generate release notes from commits
+                  $releaseNotes = @"
+                  # Release Notes - Version $version
+                  
+                  ## Deployment Information
+                  - **Version**: $version
+                  - **Environment**: PROD
+                  - **Deployed**: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                  - **Build ID**: $(Build.BuildId)
+                  
+                  ## Changes Included
+                  $(git log --oneline --since="7 days ago")
+                  
+                  ## Release Branches
+                  - CI: release/ci/$version
+                  - DEV: release/dev/$version
+                  - QA: release/qa/$version
+                  - PROD: release/prod/$version
+                  "@
+                  
+                  $releaseNotes | Out-File "$(Build.ArtifactStagingDirectory)/release-notes.md"
+                  Write-Host $releaseNotes
+                  Write-Host "✓ Release notes created"
+                pwsh: true
+            
+            - task: PublishBuildArtifacts@1
+              displayName: 'Publish Release Notes'
+              inputs:
+                pathToPublish: '$(Build.ArtifactStagingDirectory)'
+                artifactName: 'release-notes'

@@ -1,0 +1,362 @@
+# CD Pipeline - Complete Example
+# Git-integrated deployment for Microsoft Fabric workspaces
+
+# Build version format: YYYYMMDD.Rev (e.g., 20260314.1)
+# Automatically includes PR number if available (e.g., 20260314.1.7514)
+name: $(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  branches:
+    include:
+    - main
+
+pr: none  # Deployment pipeline, not for PRs
+
+pool:
+  vmImage: 'windows-latest'
+
+variables:
+  # Shared authentication (create variable group with these values)
+  - group: Fabric-Shared-Auth
+  # AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET
+
+stages:
+
+#------------------------------------------------------------------
+# Build Stage: Create version and prepare for deployment
+#------------------------------------------------------------------
+- stage: Build
+  displayName: 'Build & Version'
+  jobs:
+  - job: CreateVersion
+    displayName: 'Create Build Version'
+    steps:
+    
+    - checkout: self
+      persistCredentials: true
+      clean: true
+    
+    - task: PowerShell@2
+      displayName: 'Calculate Build Version'
+      name: CalculateVersion
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Build version from build number
+          $buildNumber = "$(Build.BuildNumber)"
+          Write-Host "Build Number: $buildNumber"
+          
+          # Extract PR number if this is a PR merge
+          $prNumber = ""
+          if ("$(Build.Reason)" -eq "PullRequest") {
+            $prNumber = "$(System.PullRequest.PullRequestId)"
+          } elseif ("$(Build.SourceVersionMessage)" -match "Merged PR (\d+)") {
+            $prNumber = $matches[1]
+          }
+          
+          # Create version string
+          if ($prNumber) {
+            $buildVersion = "$buildNumber.$prNumber"
+          } else {
+            $buildVersion = $buildNumber
+          }
+          
+          Write-Host "Build Version: $buildVersion"
+          Write-Host "##vso[task.setvariable variable=buildVersion;isOutput=true]$buildVersion"
+
+#------------------------------------------------------------------
+# CI Environment: Auto-deploy to CI workspace
+#------------------------------------------------------------------
+- stage: DeployCI
+  displayName: 'Deploy to CI'
+  dependsOn: Build
+  variables:
+    buildVersion: $[ stageDependencies.build.CreateVersion.outputs['CalculateVersion.buildVersion'] ]
+    - group: Fabric-Workspace-CI  # WorkspaceName, LakehouseName
+  jobs:
+  - deployment: DeployToCI
+    displayName: 'Deploy to CI Environment'
+    environment: Fabric-CI
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          
+          - checkout: self
+            persistCredentials: true
+          
+          - task: PowerShell@2
+            displayName: 'Create Release Branch'
+            inputs:
+              targetType: 'inline'
+              script: |
+                git config user.email "azure-pipelines@yourdomain.com"
+                git config user.name "Azure Pipelines"
+                
+                $branch = "release/ci/$(buildVersion)"
+                git checkout -b $branch
+                git push origin $branch
+                
+                Write-Host "Created release branch: $branch"
+          
+          - task: PowerShell@2
+            displayName: 'Substitute Variable Libraries'
+            inputs:
+              filePath: '$(Build.SourcesDirectory)/scripts/substitute-variable-libraries.ps1'
+              arguments: >
+                -WorkspaceName "$(WorkspaceName)"
+                -TenantId "$(AZURE_TENANT_ID)"
+                -ClientId "$(AZURE_CLIENT_ID)"
+                -ClientSecret "$(AZURE_CLIENT_SECRET)"
+            env:
+              AZURE_TENANT_ID: $(AZURE_TENANT_ID)
+              AZURE_CLIENT_ID: $(AZURE_CLIENT_ID)
+              AZURE_CLIENT_SECRET: $(AZURE_CLIENT_SECRET)
+          
+          - task: PowerShell@2
+            displayName: 'Commit Variable Substitutions'
+            inputs:
+              targetType: 'inline'
+              script: |
+                git add .
+                git commit -m "CI: Substitute variables for CI workspace [skip ci]" || echo "No changes to commit"
+                git push origin release/ci/$(buildVersion)
+          
+          - task: PowerShell@2
+            displayName: 'Deploy to Fabric Workspace'
+            inputs:
+              filePath: '$(Build.SourcesDirectory)/scripts/deploy-to-fabric.ps1'
+              arguments: >
+                -WorkspaceName "$(WorkspaceName)"
+                -BranchName "release/ci/$(buildVersion)"
+                -TenantId "$(AZURE_TENANT_ID)"
+                -ClientId "$(AZURE_CLIENT_ID)"
+                -ClientSecret "$(AZURE_CLIENT_SECRET)"
+
+#------------------------------------------------------------------
+# DEV Environment: Deploy with approval required
+#------------------------------------------------------------------
+- stage: DeployDEV
+  displayName: 'Deploy to DEV'
+  dependsOn: 
+    - Build
+    - DeployCI
+  condition: succeeded()
+  variables:
+    buildVersion: $[ stageDependencies.Build.CreateVersion.outputs['CalculateVersion.buildVersion'] ]
+    - group: Fabric-Workspace-DEV  # WorkspaceName, LakehouseName
+  jobs:
+  - deployment: DeployToDEV
+    displayName: 'Deploy to DEV Environment'
+    environment: Fabric-DEV  # Requires approval
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          
+          - checkout: self
+            persistCredentials: true
+          
+          - task: PowerShell@2
+            displayName: 'Create Release Branch'
+            inputs:
+              targetType: 'inline'
+              script: |
+                git config user.email "azure-pipelines@yourdomain.com"
+                git config user.name "Azure Pipelines"
+                
+                $branch = "release/dev/$(buildVersion)"
+                git checkout -b $branch origin/main
+                git push origin $branch
+          
+          - task: PowerShell@2
+            displayName: 'Substitute Variable Libraries'
+            inputs:
+              filePath: '$(Build.SourcesDirectory)/scripts/substitute-variable-libraries.ps1'
+              arguments: >
+                -WorkspaceName "$(WorkspaceName)"
+                -TenantId "$(AZURE_TENANT_ID)"
+                -ClientId "$(AZURE_CLIENT_ID)"
+                -ClientSecret "$(AZURE_CLIENT_SECRET)"
+          
+          - task: PowerShell@2
+            displayName: 'Commit and Deploy'
+            inputs:
+              targetType: 'inline'
+              script: |
+                git add .
+                git commit -m "DEV: Substitute variables [skip ci]" || echo "No changes"
+                git push origin release/dev/$(buildVersion)
+          
+          - task: PowerShell@2
+            displayName: 'Deploy to Fabric Workspace'
+            inputs:
+              filePath: '$(Build.SourcesDirectory)/scripts/deploy-to-fabric.ps1'
+              arguments: >
+                -WorkspaceName "$(WorkspaceName)"
+                -BranchName "release/dev/$(buildVersion)"
+                -TenantId "$(AZURE_TENANT_ID)"
+                -ClientId "$(AZURE_CLIENT_ID)"
+                -ClientSecret "$(AZURE_CLIENT_SECRET)"
+
+#------------------------------------------------------------------
+# QA Environment: Deploy with approval required
+#------------------------------------------------------------------
+- stage: DeployQA
+  displayName: 'Deploy to QA'
+  dependsOn: 
+    - Build
+    - DeployDEV
+  condition: succeeded()
+  variables:
+    buildVersion: $[ stageDependencies.Build.CreateVersion.outputs['CalculateVersion.buildVersion'] ]
+    - group: Fabric-Workspace-QA
+  jobs:
+  - deployment: DeployToQA
+    displayName: 'Deploy to QA Environment'
+    environment: Fabric-QA  # Requires approval
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          
+          - checkout: self
+            persistCredentials: true
+          
+          - task: PowerShell@2
+            displayName: 'Create Release Branch'
+            inputs:
+              targetType: 'inline'
+              script: |
+                git config user.email "azure-pipelines@yourdomain.com"
+                git config user.name "Azure Pipelines"
+                
+                $branch = "release/qa/$(buildVersion)"
+                git checkout -b $branch origin/main
+                git push origin $branch
+          
+          - task: PowerShell@2
+            displayName: 'Substitute and Deploy'
+            inputs:
+              filePath: '$(Build.SourcesDirectory)/scripts/substitute-variable-libraries.ps1'
+              arguments: >
+                -WorkspaceName "$(WorkspaceName)"
+                -TenantId "$(AZURE_TENANT_ID)"
+                -ClientId "$(AZURE_CLIENT_ID)"
+                -ClientSecret "$(AZURE_CLIENT_SECRET)"
+          
+          - task: PowerShell@2
+            displayName: 'Commit and Deploy'
+            inputs:
+              targetType: 'inline'
+              script: |
+                git add .
+                git commit -m "QA: Substitute variables [skip ci]" || echo "No changes"
+                git push origin release/qa/$(buildVersion)
+          
+          - task: PowerShell@2
+            displayName: 'Deploy to Fabric Workspace'
+            inputs:
+              filePath: '$(Build.SourcesDirectory)/scripts/deploy-to-fabric.ps1'
+              arguments: >
+                -WorkspaceName "$(WorkspaceName)"
+                -BranchName "release/qa/$(buildVersion)"
+                -TenantId "$(AZURE_TENANT_ID)"
+                -ClientId "$(AZURE_CLIENT_ID)"
+                -ClientSecret "$(AZURE_CLIENT_SECRET)"
+
+#------------------------------------------------------------------
+# PROD Environment: Deploy with approval and release notes
+#------------------------------------------------------------------
+- stage: DeployPROD
+  displayName: 'Deploy to PROD'
+  dependsOn: 
+    - Build
+    - DeployQA
+  condition: succeeded()
+  variables:
+    buildVersion: $[ stageDependencies.Build.CreateVersion.outputs['CalculateVersion.buildVersion'] ]
+    - group: Fabric-Workspace-PROD
+  jobs:
+  - deployment: DeployToPROD
+    displayName: 'Deploy to PROD Environment'
+    environment: Fabric-PROD  # Requires approval from multiple approvers
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          
+          - checkout: self
+            persistCredentials: true
+          
+          - task: PowerShell@2
+            displayName: 'Create Release Branch'
+            inputs:
+              targetType: 'inline'
+              script: |
+                git config user.email "azure-pipelines@yourdomain.com"
+                git config user.name "Azure Pipelines"
+                
+                $branch = "release/prod/$(buildVersion)"
+                git checkout -b $branch origin/main
+                git push origin $branch
+          
+          - task: PowerShell@2
+            displayName: 'Substitute and Deploy'
+            inputs:
+              filePath: '$(Build.SourcesDirectory)/scripts/substitute-variable-libraries.ps1'
+              arguments: >
+                -WorkspaceName "$(WorkspaceName)"
+                -TenantId "$(AZURE_TENANT_ID)"
+                -ClientId "$(AZURE_CLIENT_ID)"
+                -ClientSecret "$(AZURE_CLIENT_SECRET)"
+          
+          - task: PowerShell@2
+            displayName: 'Commit Changes'
+            inputs:
+              targetType: 'inline'
+              script: |
+                git add .
+                git commit -m "PROD: Substitute variables [skip ci]" || echo "No changes"
+                git push origin release/prod/$(buildVersion)
+          
+          - task: PowerShell@2
+            displayName: 'Deploy to Fabric Workspace'
+            inputs:
+              filePath: '$(Build.SourcesDirectory)/scripts/deploy-to-fabric.ps1'
+              arguments: >
+                -WorkspaceName "$(WorkspaceName)"
+                -BranchName "release/prod/$(buildVersion)"
+                -TenantId "$(AZURE_TENANT_ID)"
+                -ClientId "$(AZURE_CLIENT_ID)"
+                -ClientSecret "$(AZURE_CLIENT_SECRET)"
+          
+          - task: PowerShell@2
+            displayName: 'Generate Release Notes'
+            inputs:
+              targetType: 'inline'
+              script: |
+                Write-Host "=== Release Notes for $(buildVersion) ==="
+                Write-Host ""
+                Write-Host "Deployed to PROD: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+                Write-Host "Release Branch: release/prod/$(buildVersion)"
+                Write-Host ""
+                
+                # Get commits since last production deployment
+                $lastProdTag = git describe --tags --abbrev=0 --match "prod-*" 2>$null
+                if ($lastProdTag) {
+                  Write-Host "Changes since $lastProdTag:"
+                  git log --oneline $lastProdTag..HEAD
+                } else {
+                  Write-Host "Recent changes:"
+                  git log --oneline -10
+                }
+          
+          - task: PowerShell@2
+            displayName: 'Tag Production Release'
+            inputs:
+              targetType: 'inline'
+              script: |
+                git tag -a "prod-$(buildVersion)" -m "Production release $(buildVersion)"
+                git push origin "prod-$(buildVersion)"
+                Write-Host "Created production tag: prod-$(buildVersion)"
